@@ -1,0 +1,498 @@
+#!/bin/bash
+# ==============================================================================
+# MULTI-ARR SMART QUEUE CLEANER & AUTO-IMPORTER (Unraid User Scripts)
+# Supports: Radarr, Sonarr, Lidarr, Chaptarr, Readarr, Whisparr (multiple instances)
+# ==============================================================================
+
+### ----------------------------------------------------------------------------
+### 1. USER CONFIGURATION
+### ----------------------------------------------------------------------------
+
+LOG_FILE="/mnt/user/appdata/other/scripts/arrs/arr_queue_cleaner.log"
+MAX_LOG_LINES=2000
+
+# Master Dry-Run override:
+# "Y" = Force ALL instances to Dry-Run regardless of instance setting
+# "N" = Respect each instance's individual DryRun setting below
+GLOBAL_DRY_RUN="Y"
+
+# --- ARR INSTANCES ---
+# Delimiter: "::"
+# Format: "Label :: AppType :: BaseHost :: ConfigXMLPath :: DryRun(Y/N)"
+# AppType: radarr | sonarr | lidarr | chaptarr | readarr | whisparr
+ARR_INSTANCES=(
+  "Radarr   :: radarr   :: http://192.168.1.1:7878 :: /mnt/computers/appdata_media/dockers/radarr/config.xml   :: Y"
+  "Sonarr   :: sonarr   :: http://192.168.1.1:8989 :: /mnt/computers/appdata_media/dockers/sonarr/config.xml   :: Y"
+  "Lidarr   :: lidarr   :: http://192.168.1.1:8686 :: /mnt/computers/appdata_media/dockers/lidarr/config.xml   :: Y"
+  "Chaptarr :: chaptarr :: http://192.168.1.1:8789 :: /mnt/computers/appdata_media/dockers/chaptarr/config.xml :: Y"
+  # Add extra instances easily, e.g.:
+  # "Radarr-4K :: radarr :: http://192.168.1.1:7879 :: /mnt/computers/appdata_media/dockers/radarr4k/config.xml :: Y"
+)
+
+# --- QUEUE CLEANUP & IMPORT RULES ---
+# Evaluated top-to-bottom (first matching enabled rule wins).
+# Delimiter: "::"
+# Format: "RuleID :: Enabled(Y/N) :: AppFilter :: MinAgeHours :: MatchRegex :: Action"
+#
+# Actions:
+#   AUTO_IMPORT          -> Force-import using queue/history's known target IDs (only if no other rejections)
+#   REMOVE               -> Remove from queue & client, NO blocklist, NO re-search
+#   REMOVE_AND_SEARCH    -> Remove from queue & client, NO blocklist, trigger re-search
+#   BLOCKLIST_AND_SEARCH -> Remove from queue & client, ADD to blocklist, trigger re-search
+#   BLOCKLIST_ONLY       -> Remove from queue & client, ADD to blocklist, NO re-search
+#   IGNORE               -> Leave untouched
+
+QUEUE_RULES=(
+  # 1. Not an upgrade -> just remove cleanly without blocklisting
+  "not_cf_upgrade        :: Y :: *                                      :: 0  :: Not a Custom Format upgrade|Not an upgrade for existing                     :: REMOVE"
+
+  # 2. Ambiguous title / artist / book / ID match -> auto-import using the exact ID Arr grabbed it for
+  "multiple_match        :: Y :: radarr,lidarr,chaptarr,readarr :: 0  :: Unable to import automatically, found multiple                             :: AUTO_IMPORT"
+  "title_mismatch        :: Y :: radarr,sonarr,lidarr,chaptarr  :: 0  :: Title mismatch; automatic import is not possible                           :: AUTO_IMPORT"
+  "matched_by_id         :: Y :: radarr,sonarr,lidarr,chaptarr  :: 0  :: Matched to (series|movie|artist|album|author|book) by ID                 :: AUTO_IMPORT"
+
+  # 2b. Chaptarr/Readarr split:
+  #     - Same book title across duplicate metadata editions (e.g., Goodreads vs Hardcover) -> AUTO_IMPORT
+  #     - Different book title / omnibus anthology -> BLOCKLIST_AND_SEARCH
+  "book_edition_mismatch :: Y :: chaptarr,readarr                       :: 0  :: grabbed for '([^']+)' \(BookId [0-9]+, [^)]+\), but import matched '\1'   :: AUTO_IMPORT"
+  "book_wrong_or_omnibus :: Y :: chaptarr,readarr                       :: 0  :: Completed download was grabbed for .* but import matched                   :: BLOCKLIST_AND_SEARCH"
+
+  # 3. Lidarr partial / mismatched albums
+  "album_low_match       :: Y :: lidarr                                 :: 0  :: Album match is not close enough                                            :: BLOCKLIST_AND_SEARCH"
+  "missing_tracks        :: N :: lidarr                                 :: 24 :: Has missing tracks                                                         :: BLOCKLIST_AND_SEARCH"
+
+  # 4. Invalid season/episode (Tiered: ignored for 48h so you can manually fix; removed without blocklist after 48h)
+  "invalid_ep_recent     :: Y :: sonarr                                 :: 0  :: Invalid season or episode                                                  :: IGNORE"
+  "invalid_ep_stale      :: N :: sonarr                                 :: 48 :: Invalid season or episode                                                  :: REMOVE"
+
+  # 5. Missing episodes / empty / sample-only releases
+  "ep_not_found          :: Y :: sonarr                                 :: 48 :: was not found in the grabbed release|Episodes not imported                  :: BLOCKLIST_AND_SEARCH"
+  "no_eligible_files     :: Y :: *                                      :: 48 :: No files found are eligible for import                                     :: BLOCKLIST_AND_SEARCH"
+  "sample_only           :: Y :: *                                      :: 0  :: Sample                                                                     :: BLOCKLIST_AND_SEARCH"
+  "file_empty            :: Y :: *                                      :: 0  :: Downloaded file is empty                                                   :: BLOCKLIST_AND_SEARCH"
+  "unable_to_parse       :: N :: *                                      :: 0  :: Unable to parse download                                                   :: BLOCKLIST_AND_SEARCH"
+
+  # 6. Dead / DMCA / Debrid-blocked downloads
+  "failed_download       :: Y :: *                                      :: 0  :: Failed download|torrent_blocked|UnavailableForLegalReasons                 :: BLOCKLIST_AND_SEARCH"
+)
+
+### ----------------------------------------------------------------------------
+### 2. HELPER FUNCTIONS
+### ----------------------------------------------------------------------------
+
+trim() {
+  local var="$*"
+  var="${var#"${var%%[![:space:]]*}"}"
+  var="${var%"${var##*[![:space:]]}"}"
+  printf '%s' "$var"
+}
+
+split_fields() {
+  local str="$1"
+  FIELDS=()
+  while [[ "$str" == *"::"* ]]; do
+    FIELDS+=("$(trim "${str%%::*}")")
+    str="${str#*::}"
+  done
+  FIELDS+=("$(trim "$str")")
+}
+
+log_msg() {
+  local LEVEL="$1"
+  local MSG="$2"
+  local LINE="[$(date '+%Y-%m-%d %H:%M:%S')] [$LEVEL] $MSG"
+  echo "$LINE"
+  [[ -n "$LOG_FILE" ]] && echo "$LINE" >> "$LOG_FILE"
+}
+
+rotate_log() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  local LINES
+  LINES=$(wc -l < "$LOG_FILE")
+  if (( LINES > MAX_LOG_LINES )); then
+    tail -n "$MAX_LOG_LINES" "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+  fi
+}
+
+parse_arr_config() {
+  local CONFIG_FILE="$1"
+  local FIELD="$2"
+  [[ -f "$CONFIG_FILE" ]] || return 1
+  sed -n "s/.*<${FIELD}>\(.*\)<\/${FIELD}>.*/\1/p" "$CONFIG_FILE" | tr -d '[:space:]'
+}
+
+get_api_ver() {
+  case "${1,,}" in
+    radarr|sonarr|whisparr) echo "v3" ;;
+    lidarr|chaptarr|readarr) echo "v1" ;;
+    *) echo "v3" ;;
+  esac
+}
+
+calc_age_hours() {
+  local ADDED_ISO="$1"
+  [[ -z "$ADDED_ISO" || "$ADDED_ISO" == "null" ]] && { echo 999999; return; }
+  local ADDED_EPOCH NOW_EPOCH
+  ADDED_EPOCH=$(date -d "$ADDED_ISO" +%s 2>/dev/null) || { echo 999999; return; }
+  NOW_EPOCH=$(date +%s)
+  echo $(( (NOW_EPOCH - ADDED_EPOCH) / 3600 ))
+}
+
+app_matches_filter() {
+  local APP_TYPE="${1,,}"
+  local FILTER="${2,,}"
+  [[ "$FILTER" == "*" ]] && return 0
+  IFS=',' read -ra ALLOWED <<< "$FILTER"
+  for A in "${ALLOWED[@]}"; do
+    [[ "$(trim "$A")" == "$APP_TYPE" ]] && return 0
+  done
+  return 1
+}
+
+resolve_targets_from_history() {
+  local FULL_URL="$1" API_VER="$2" API_KEY="$3" DOWNLOAD_ID="$4"
+  [[ -z "$DOWNLOAD_ID" || "$DOWNLOAD_ID" == "null" ]] && return 1
+
+  local HIST_JSON
+  HIST_JSON=$(curl -sS -m 30 -H "X-Api-Key: $API_KEY" \
+    "${FULL_URL}/api/${API_VER}/history?downloadId=${DOWNLOAD_ID}&pageSize=1")
+
+  echo "$HIST_JSON" | jq -r '
+    .records[0] // {} |
+    "\(.movieId // .seriesId // .artistId // .authorId // "")|\(.albumId // .bookId // "")"
+  ' 2>/dev/null
+}
+
+### ----------------------------------------------------------------------------
+### 3. QUEUE ACTIONS
+### ----------------------------------------------------------------------------
+
+execute_queue_delete() {
+  local FULL_URL="$1" API_VER="$2" API_KEY="$3" QUEUE_ID="$4"
+  local BLOCKLIST="$5" SKIP_REDOWNLOAD="$6"
+
+  curl -s -o /dev/null -w "%{http_code}" -m 60 \
+    -X DELETE "${FULL_URL}/api/${API_VER}/queue/${QUEUE_ID}?removeFromClient=true&blocklist=${BLOCKLIST}&skipRedownload=${SKIP_REDOWNLOAD}" \
+    -H "X-Api-Key: $API_KEY"
+}
+
+execute_auto_import() {
+  local FULL_URL="$1" API_VER="$2" API_KEY="$3" APP_TYPE="$4"
+  local DOWNLOAD_ID="$5" TARGET_ID="$6" SECONDARY_ID="$7" LABEL="$8" TITLE="$9" DRY_RUN="${10}"
+
+  if [[ -z "$DOWNLOAD_ID" || "$DOWNLOAD_ID" == "null" ]]; then
+    log_msg "WARN" "[$LABEL] Cannot auto-import '$TITLE' — missing downloadId."
+    return 1
+  fi
+
+  local NEEDS_SECONDARY="N"
+  [[ "$APP_TYPE" == "lidarr" || "$APP_TYPE" == "chaptarr" || "$APP_TYPE" == "readarr" ]] && NEEDS_SECONDARY="Y"
+
+  if [[ -z "$TARGET_ID" || "$TARGET_ID" == "null" ]] || [[ "$NEEDS_SECONDARY" == "Y" && ( -z "$SECONDARY_ID" || "$SECONDARY_ID" == "null" ) ]]; then
+    local HIST_PAIR H_PRIMARY H_SECONDARY
+    HIST_PAIR=$(resolve_targets_from_history "$FULL_URL" "$API_VER" "$API_KEY" "$DOWNLOAD_ID")
+    H_PRIMARY="${HIST_PAIR%%|*}"
+    H_SECONDARY="${HIST_PAIR#*|}"
+    [[ -z "$TARGET_ID" || "$TARGET_ID" == "null" ]] && TARGET_ID="$H_PRIMARY"
+    [[ -z "$SECONDARY_ID" || "$SECONDARY_ID" == "null" ]] && SECONDARY_ID="$H_SECONDARY"
+  fi
+
+  if [[ -z "$TARGET_ID" || "$TARGET_ID" == "null" ]]; then
+    log_msg "WARN" "[$LABEL] Cannot auto-import '$TITLE' — could not resolve target ID from queue or history (downloadId: $DOWNLOAD_ID)."
+    return 1
+  fi
+
+  local PREVIEW_JSON
+  PREVIEW_JSON=$(curl -sS -m 60 -H "X-Api-Key: $API_KEY" \
+    "${FULL_URL}/api/${API_VER}/manualimport?downloadId=${DOWNLOAD_ID}&filterExistingFiles=true")
+
+  if ! echo "$PREVIEW_JSON" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+    log_msg "WARN" "[$LABEL] ManualImport preview returned no eligible files for '$TITLE'."
+    return 1
+  fi
+
+  local OTHER_REJECTIONS
+  OTHER_REJECTIONS=$(echo "$PREVIEW_JSON" | jq -r '
+    [.[].rejections[]?.reason // empty]
+    | map(select(test("found multiple|Title mismatch|Matched to .* by ID|Completed download was grabbed for .* but import matched"; "i") | not))
+    | join("; ")
+  ')
+
+  if [[ -n "$OTHER_REJECTIONS" ]]; then
+    log_msg "INFO" "[$LABEL] Skipping AUTO_IMPORT for '$TITLE' due to secondary rejection(s): $OTHER_REJECTIONS"
+    return 2
+  fi
+
+  if [[ "$DRY_RUN" == "Y" ]]; then
+    log_msg "INFO" "[$LABEL] [DRY RUN] Would AUTO_IMPORT '$TITLE' (downloadId: $DOWNLOAD_ID -> ${APP_TYPE}Id: $TARGET_ID${SECONDARY_ID:+ / subId: $SECONDARY_ID})"
+    return 0
+  fi
+
+  local FILES_PAYLOAD CMD_PAYLOAD HTTP_CODE
+  if [[ "$APP_TYPE" == "radarr" || "$APP_TYPE" == "whisparr" ]]; then
+    FILES_PAYLOAD=$(echo "$PREVIEW_JSON" | jq -c --argjson mid "$TARGET_ID" '
+      [.[] | {
+        path: .path,
+        folderName: .folderName,
+        movieId: $mid,
+        quality: .quality,
+        languages: .languages,
+        releaseGroup: (.releaseGroup // ""),
+        indexerFlags: (.indexerFlags // 0),
+        downloadId: .downloadId
+      }]
+    ')
+  elif [[ "$APP_TYPE" == "sonarr" ]]; then
+    FILES_PAYLOAD=$(echo "$PREVIEW_JSON" | jq -c --argjson sid "$TARGET_ID" '
+      [.[] | select((.episodes | length) > 0) | {
+        path: .path,
+        folderName: .folderName,
+        seriesId: $sid,
+        episodeIds: [.episodes[].id],
+        quality: .quality,
+        languages: .languages,
+        releaseGroup: (.releaseGroup // ""),
+        indexerFlags: (.indexerFlags // 0),
+        downloadId: .downloadId
+      }]
+    ')
+  elif [[ "$APP_TYPE" == "lidarr" ]]; then
+    FILES_PAYLOAD=$(echo "$PREVIEW_JSON" | jq -c --argjson aid "$TARGET_ID" --arg subid "$SECONDARY_ID" '
+      [.[] |
+        (($subid | tonumber? ) // .album.id // empty) as $albid |
+        select($albid != null and ((.tracks | length) > 0)) | {
+          path: .path,
+          folderName: .folderName,
+          artistId: $aid,
+          albumId: $albid,
+          trackIds: [.tracks[].id],
+          quality: .quality,
+          releaseGroup: (.releaseGroup // ""),
+          indexerFlags: (.indexerFlags // 0),
+          downloadId: .downloadId
+        }
+      ]
+    ')
+  elif [[ "$APP_TYPE" == "chaptarr" || "$APP_TYPE" == "readarr" ]]; then
+    FILES_PAYLOAD=$(echo "$PREVIEW_JSON" | jq -c --argjson authid "$TARGET_ID" --arg subid "$SECONDARY_ID" '
+      [.[] |
+        (($subid | tonumber? ) // .book.id // empty) as $bkid |
+        select($bkid != null) | {
+          path: .path,
+          folderName: .folderName,
+          authorId: $authid,
+          bookId: $bkid,
+          quality: .quality,
+          releaseGroup: (.releaseGroup // ""),
+          indexerFlags: (.indexerFlags // 0),
+          downloadId: .downloadId
+        }
+      ]
+    ')
+  else
+    log_msg "WARN" "[$LABEL] AUTO_IMPORT not supported for app type '$APP_TYPE'."
+    return 1
+  fi
+
+  if [[ -z "$FILES_PAYLOAD" || "$FILES_PAYLOAD" == "[]" ]]; then
+    log_msg "WARN" "[$LABEL] No mappable files/tracks built for '$TITLE'."
+    return 1
+  fi
+
+  CMD_PAYLOAD=$(jq -nc --argjson files "$FILES_PAYLOAD" '{
+    name: "ManualImport",
+    files: $files,
+    importMode: "auto"
+  }')
+
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 60 \
+    -X POST "${FULL_URL}/api/${API_VER}/command" \
+    -H "X-Api-Key: $API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$CMD_PAYLOAD")
+
+  if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" || "$HTTP_CODE" == "202" ]]; then
+    log_msg "SUCCESS" "[$LABEL] Triggered AUTO_IMPORT for '$TITLE' (${APP_TYPE}Id: $TARGET_ID${SECONDARY_ID:+ / subId: $SECONDARY_ID})"
+    return 0
+  else
+    log_msg "WARN" "[$LABEL] AUTO_IMPORT API call failed for '$TITLE' (HTTP $HTTP_CODE)."
+    return 1
+  fi
+}
+
+### ----------------------------------------------------------------------------
+### 4. MAIN INSTANCE PROCESSOR
+### ----------------------------------------------------------------------------
+
+process_instance() {
+  local RAW_ENTRY="$1"
+  split_fields "$RAW_ENTRY"
+
+  local LABEL="${FIELDS[0]}"
+  local APP_TYPE="${FIELDS[1],,}"
+  local BASE_HOST="${FIELDS[2]%/}"
+  local CONFIG_FILE="${FIELDS[3]}"
+  local INST_DRY="${FIELDS[4]^^}"
+  local DRY_RUN
+
+  [[ "${GLOBAL_DRY_RUN^^}" == "Y" ]] && DRY_RUN="Y" || DRY_RUN="$INST_DRY"
+
+  local API_KEY RAW_BASE URL_BASE="" FULL_URL API_VER
+  API_KEY=$(parse_arr_config "$CONFIG_FILE" "ApiKey")
+  RAW_BASE=$(parse_arr_config "$CONFIG_FILE" "UrlBase")
+  API_VER=$(get_api_ver "$APP_TYPE")
+
+  if [[ -z "$API_KEY" ]]; then
+    log_msg "WARN" "[$LABEL] Could not read ApiKey from '$CONFIG_FILE'. Skipping."
+    return 1
+  fi
+
+  if [[ -n "$RAW_BASE" && "$RAW_BASE" != "/" ]]; then
+    URL_BASE="/${RAW_BASE#/}"
+    URL_BASE="${URL_BASE%/}"
+  fi
+  FULL_URL="${BASE_HOST}${URL_BASE}"
+
+  local QUEUE_JSON TOTAL_RECORDS
+  QUEUE_JSON=$(curl -sS -m 60 -H "X-Api-Key: $API_KEY" \
+    "${FULL_URL}/api/${API_VER}/queue?page=1&pageSize=1000&includeUnknownMovieItems=true&includeUnknownSeriesItems=true&includeUnknownArtistItems=true&includeUnknownAuthorItems=true")
+
+  if ! echo "$QUEUE_JSON" | jq -e '.records | type == "array"' >/dev/null 2>&1; then
+    log_msg "WARN" "[$LABEL] Failed to fetch queue from ${FULL_URL}/api/${API_VER}/queue. Skipping."
+    return 1
+  fi
+
+  TOTAL_RECORDS=$(echo "$QUEUE_JSON" | jq '.records | length')
+  log_msg "INFO" "[$LABEL] Scanning $TOTAL_RECORDS queue item(s) (DryRun: $DRY_RUN)..."
+
+  local ACTION_COUNT=0
+  local SEEN_Q_IDS="|"
+
+  while IFS= read -r B64_ITEM; do
+    [[ -z "$B64_ITEM" ]] && continue
+    local ITEM
+    ITEM=$(echo "$B64_ITEM" | base64 -d)
+
+    local Q_ID TITLE DOWNLOAD_ID ADDED_AT COMBINED_MSG TARGET_ID SECONDARY_ID
+    Q_ID=$(echo "$ITEM" | jq -r '.id')
+
+    [[ "$SEEN_Q_IDS" == *"|${Q_ID}|"* ]] && continue
+    SEEN_Q_IDS="${SEEN_Q_IDS}${Q_ID}|"
+
+    TITLE=$(echo "$ITEM" | jq -r '.title // "Unknown"')
+    DOWNLOAD_ID=$(echo "$ITEM" | jq -r '.downloadId // ""')
+    ADDED_AT=$(echo "$ITEM" | jq -r '.added // ""')
+    TARGET_ID=$(echo "$ITEM" | jq -r '.movieId // .seriesId // .artistId // .authorId // ""')
+    SECONDARY_ID=$(echo "$ITEM" | jq -r '.albumId // .bookId // ""')
+
+    COMBINED_MSG=$(echo "$ITEM" | jq -r '
+      [
+        (.status // ""),
+        (.trackedDownloadStatus // ""),
+        (.trackedDownloadState // ""),
+        (.errorMessage // ""),
+        (.statusMessages[]? | (.title // ""), (.messages[]? // ""))
+      ] | map(select(. != "")) | join(" | ")
+    ')
+
+    local AGE_HOURS
+    AGE_HOURS=$(calc_age_hours "$ADDED_AT")
+
+    for RAW_RULE in "${QUEUE_RULES[@]}"; do
+      split_fields "$RAW_RULE"
+      local R_ID="${FIELDS[0]}"
+      local R_EN="${FIELDS[1]^^}"
+      local R_APP="${FIELDS[2]}"
+      local R_AGE="${FIELDS[3]}"
+      local R_REGEX="${FIELDS[4]}"
+      local R_ACT="${FIELDS[5]^^}"
+
+      [[ "$R_EN" != "Y" ]] && continue
+      app_matches_filter "$APP_TYPE" "$R_APP" || continue
+      (( AGE_HOURS < R_AGE )) && continue
+
+      if printf '%s\n' "$COMBINED_MSG" | grep -Eiq -- "$R_REGEX"; then
+        case "$R_ACT" in
+          IGNORE)
+            break
+            ;;
+          AUTO_IMPORT)
+            execute_auto_import "$FULL_URL" "$API_VER" "$API_KEY" "$APP_TYPE" \
+              "$DOWNLOAD_ID" "$TARGET_ID" "$SECONDARY_ID" "$LABEL" "$TITLE" "$DRY_RUN"
+            local IMP_RC=$?
+            if [[ $IMP_RC -eq 0 ]]; then
+              ((ACTION_COUNT++))
+              [[ "$DRY_RUN" == "N" ]] && sleep 2
+              break
+            elif [[ $IMP_RC -eq 2 ]]; then
+              continue
+            else
+              break
+            fi
+            ;;
+          REMOVE)
+            if [[ "$DRY_RUN" == "Y" ]]; then
+              log_msg "INFO" "[$LABEL] [DRY RUN] [$R_ID] Would REMOVE '$TITLE' (Age: ${AGE_HOURS}h | Msg: $COMBINED_MSG)"
+            else
+              local CODE
+              CODE=$(execute_queue_delete "$FULL_URL" "$API_VER" "$API_KEY" "$Q_ID" "false" "true")
+              log_msg "SUCCESS" "[$LABEL] [$R_ID] REMOVED '$TITLE' (HTTP $CODE)"
+            fi
+            ((ACTION_COUNT++))
+            break
+            ;;
+          REMOVE_AND_SEARCH)
+            if [[ "$DRY_RUN" == "Y" ]]; then
+              log_msg "INFO" "[$LABEL] [DRY RUN] [$R_ID] Would REMOVE + RE-SEARCH '$TITLE' (Age: ${AGE_HOURS}h)"
+            else
+              local CODE
+              CODE=$(execute_queue_delete "$FULL_URL" "$API_VER" "$API_KEY" "$Q_ID" "false" "false")
+              log_msg "SUCCESS" "[$LABEL] [$R_ID] REMOVED + RE-SEARCHED '$TITLE' (HTTP $CODE)"
+            fi
+            ((ACTION_COUNT++))
+            break
+            ;;
+          BLOCKLIST_AND_SEARCH)
+            if [[ "$DRY_RUN" == "Y" ]]; then
+              log_msg "INFO" "[$LABEL] [DRY RUN] [$R_ID] Would BLOCKLIST + RE-SEARCH '$TITLE' (Age: ${AGE_HOURS}h | Msg: $COMBINED_MSG)"
+            else
+              local CODE
+              CODE=$(execute_queue_delete "$FULL_URL" "$API_VER" "$API_KEY" "$Q_ID" "true" "false")
+              log_msg "SUCCESS" "[$LABEL] [$R_ID] BLOCKLISTED + RE-SEARCHED '$TITLE' (HTTP $CODE)"
+            fi
+            ((ACTION_COUNT++))
+            break
+            ;;
+          BLOCKLIST_ONLY)
+            if [[ "$DRY_RUN" == "Y" ]]; then
+              log_msg "INFO" "[$LABEL] [DRY RUN] [$R_ID] Would BLOCKLIST (no re-search) '$TITLE' (Age: ${AGE_HOURS}h)"
+            else
+              local CODE
+              CODE=$(execute_queue_delete "$FULL_URL" "$API_VER" "$API_KEY" "$Q_ID" "true" "true")
+              log_msg "SUCCESS" "[$LABEL] [$R_ID] BLOCKLISTED '$TITLE' (HTTP $CODE)"
+            fi
+            ((ACTION_COUNT++))
+            break
+            ;;
+        esac
+      fi
+    done
+  done < <(echo "$QUEUE_JSON" | jq -r '.records[] | @base64')
+
+  log_msg "INFO" "[$LABEL] Finished: $ACTION_COUNT item(s) matched rules."
+}
+
+### ----------------------------------------------------------------------------
+### 5. EXECUTION
+### ----------------------------------------------------------------------------
+
+[[ -n "$LOG_FILE" ]] && mkdir -p "$(dirname "$LOG_FILE")"
+rotate_log
+log_msg "INFO" "=== Starting Multi-Arr Queue Cleaner (Global DryRun: $GLOBAL_DRY_RUN) ==="
+
+for ENTRY in "${ARR_INSTANCES[@]}"; do
+  [[ -z "$(trim "$ENTRY")" ]] && continue
+  process_instance "$ENTRY"
+done
+
+log_msg "INFO" "=== Queue Cleaner Complete ==="
