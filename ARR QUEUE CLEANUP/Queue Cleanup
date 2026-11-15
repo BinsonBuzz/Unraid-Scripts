@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # MULTI-ARR SMART QUEUE CLEANER & AUTO-IMPORTER (Unraid User Scripts)
-# VERSION: v0.7
+# VERSION: v0.12
 # Supports: Radarr, Sonarr, Lidarr, Chaptarr, Readarr, Whisparr (multiple instances)
 # ==============================================================================
 
@@ -9,14 +9,19 @@
 ### 1. USER CONFIGURATION
 ### ----------------------------------------------------------------------------
 
-SCRIPT_VERSION="v0.7"
+SCRIPT_VERSION="v0.12"
 LOG_FILE="/mnt/user/appdata/other/scripts/arrs/arr_queue_cleaner.log"
 MAX_LOG_LINES=2000
 
 # Master Dry-Run override:
 # "Y" = Force ALL instances to Dry-Run regardless of instance setting
 # "N" = Respect each instance's individual DryRun setting below
-GLOBAL_DRY_RUN="Y"
+GLOBAL_DRY_RUN="N"
+
+# Verbose Decision Logging:
+# "Y" = Log decisions for warning/error/unmatched queue items (healthy active imports are summarized)
+# "N" = Only log items where an action is taken (or dry-run action would be taken)
+LOG_ALL_DECISIONS="Y"
 
 # --- ARR INSTANCES ---
 # Delimiter: "::"
@@ -46,37 +51,41 @@ ARR_INSTANCES=(
 
 QUEUE_RULES=(
   # 1. Not an upgrade -> just remove cleanly without blocklisting
-  "not_cf_upgrade        :: Y :: *                                      :: 0  :: Not a Custom Format upgrade|Not an upgrade for existing                     :: REMOVE"
+  "not_cf_upgrade        :: Y :: *                                             :: 0  :: Not a Custom Format upgrade|Not an upgrade for existing                     :: REMOVE"
 
-  # 2. Ambiguous title / artist / book / ID match -> auto-import using the exact ID Arr grabbed it for
-  "multiple_match        :: Y :: radarr,lidarr,chaptarr,readarr :: 0  :: Unable to import automatically, found multiple                             :: AUTO_IMPORT"
-  "title_mismatch        :: Y :: radarr,sonarr,lidarr,chaptarr  :: 0  :: Title mismatch; automatic import is not possible                           :: AUTO_IMPORT"
-  "matched_by_id         :: Y :: radarr,sonarr,lidarr,chaptarr  :: 0  :: Matched to (series|movie|artist|album|author|book) by ID                 :: AUTO_IMPORT"
+  # 2. Ambiguous title / series / artist / book / ID match -> auto-import using the exact ID Arr grabbed it for
+  "multiple_match        :: Y :: radarr,sonarr,lidarr,chaptarr,readarr :: 0  :: Unable to import automatically, found multiple                             :: AUTO_IMPORT"
+  "title_mismatch        :: Y :: radarr,sonarrlidarr,chaptarr         :: 0  :: Title mismatch; automatic import is not possible                           :: AUTO_IMPORT"
+  "matched_by_id         :: Y :: radarr,sonarr,lidarr,chaptarr         :: 0  :: Matched to (series|movie|artist|album|author|book) by ID                 :: AUTO_IMPORT"
 
   # 2b. Chaptarr/Readarr split:
   #     - Same book title across duplicate metadata editions (e.g., Goodreads vs Hardcover) -> AUTO_IMPORT
   #     - Different book title / omnibus anthology -> BLOCKLIST_AND_SEARCH
-  "book_edition_mismatch :: Y :: chaptarr,readarr                        :: 0  :: grabbed for '([^']+)' \(BookId [0-9]+, [^)]+\), but import matched '\1'   :: AUTO_IMPORT"
-  "book_wrong_or_omnibus :: Y :: chaptarr,readarr                        :: 0  :: Completed download was grabbed for .* but import matched                   :: BLOCKLIST_AND_SEARCH"
+  "book_edition_mismatch :: Y :: chaptarr,readarr                               :: 0  :: grabbed for '([^']+)' \(BookId [0-9]+, [^)]+\), but import matched '\1'   :: AUTO_IMPORT"
+  "book_wrong_or_omnibus :: Y :: chaptarr,readarr                               :: 0  :: Completed download was grabbed for .* but import matched                   :: BLOCKLIST_AND_SEARCH"
 
   # 3. Lidarr partial / mismatched albums
-  "album_low_match       :: Y :: lidarr                                 :: 0  :: Album match is not close enough                                            :: BLOCKLIST_AND_SEARCH"
-  "missing_tracks        :: N :: lidarr                                 :: 24 :: Has missing tracks                                                         :: BLOCKLIST_AND_SEARCH"
+  "album_low_match       :: Y :: lidarr                                        :: 0  :: Album match is not close enough                                            :: BLOCKLIST_AND_SEARCH"
+  "missing_tracks        :: N :: lidarr                                        :: 24 :: Has missing tracks                                                         :: BLOCKLIST_AND_SEARCH"
 
-  # 4. Invalid season/episode (Tiered: ignored for 48h so you can manually fix; removed without blocklist after 48h)
-  "invalid_ep_recent     :: Y :: sonarr                                 :: 0  :: Invalid season or episode                                                  :: IGNORE"
-  "invalid_ep_stale      :: N :: sonarr                                 :: 48 :: Invalid season or episode                                                  :: REMOVE"
+  # 4. Invalid season/episode or DVD-vs-aired mismatch
+  "invalid_ep_recent     :: Y :: sonarr                                        :: 0  :: Invalid season or episode                                                  :: IGNORE"
+  "invalid_ep_stale      :: N :: sonarr                                        :: 48 :: Invalid season or episode                                                  :: REMOVE"
+  "unexpected_ep         :: Y :: sonarr                                        :: 24 :: was unexpected considering the .* folder name                              :: BLOCKLIST_AND_SEARCH"
 
-  # 5. Missing episodes / empty / sample-only releases
-  "ep_not_found          :: Y :: sonarr                                 :: 48 :: was not found in the grabbed release|Episodes not imported                 :: BLOCKLIST_AND_SEARCH"
-  "no_eligible_files     :: Y :: *                                      :: 48 :: No files found are eligible for import                                     :: BLOCKLIST_AND_SEARCH"
-  "sample_indeterminate  :: Y :: *                                      :: 0  :: Unable to determine if file is a sample                                    :: BLOCKLIST_AND_SEARCH"
-  "sample_only           :: Y :: *                                      :: 0  :: Sample                                                                     :: BLOCKLIST_AND_SEARCH"
-  "file_empty            :: Y :: *                                      :: 0  :: Downloaded file is empty                                                   :: BLOCKLIST_AND_SEARCH"
-  "unable_to_parse       :: N :: *                                      :: 0  :: Unable to parse download                                                   :: BLOCKLIST_AND_SEARCH"
+  # 5. Missing movie/episodes / empty / sample-only releases
+  "item_not_found        :: Y :: *                                             :: 48 :: was not found in the grabbed release|Episodes not imported                 :: BLOCKLIST_AND_SEARCH"
+  "no_eligible_files     :: Y :: *                                             :: 48 :: No files found are eligible for import                                     :: BLOCKLIST_AND_SEARCH"
+  "sample_indeterminate  :: Y :: *                                             :: 0  :: Unable to determine if file is a sample                                    :: BLOCKLIST_AND_SEARCH"
+  "sample_only           :: Y :: *                                             :: 0  :: Sample                                                                     :: BLOCKLIST_AND_SEARCH"
+  "file_empty            :: Y :: *                                             :: 0  :: Downloaded file is empty                                                   :: BLOCKLIST_AND_SEARCH"
+  "unable_to_parse       :: N :: *                                             :: 0  :: Unable to parse download                                                   :: BLOCKLIST_AND_SEARCH"
 
   # 6. Dead / DMCA / Debrid-blocked downloads
-  "failed_download       :: Y :: *                                      :: 0  :: Failed download|torrent_blocked|UnavailableForLegalReasons                 :: BLOCKLIST_AND_SEARCH"
+  "failed_download       :: Y :: *                                             :: 0  :: Failed download|torrent_blocked|UnavailableForLegalReasons                 :: BLOCKLIST_AND_SEARCH"
+
+  # 7. Healthy download wedged in importPending/importing for >24h without progressing
+  "stuck_import_pending  :: Y :: *                                             :: 24 :: ^completed \| ok \| (importPending|importing)$                             :: REMOVE_AND_SEARCH"
 )
 
 ### ----------------------------------------------------------------------------
@@ -166,6 +175,23 @@ resolve_targets_from_history() {
   ' 2>/dev/null
 }
 
+fetch_manualimport_rejections() {
+  local FULL_URL="$1" API_VER="$2" API_KEY="$3" DOWNLOAD_ID="$4"
+  [[ -z "$DOWNLOAD_ID" || "$DOWNLOAD_ID" == "null" ]] && return 0
+
+  local MI_JSON
+  MI_JSON=$(curl -sS -m 30 -H "X-Api-Key: $API_KEY" \
+    "${FULL_URL}/api/${API_VER}/manualimport?downloadId=${DOWNLOAD_ID}&filterExistingFiles=false" 2>/dev/null)
+
+  echo "$MI_JSON" | jq -r '
+    if type == "array" then
+      [.[].rejections[]?.reason // empty] | unique | join(" | ")
+    else
+      ""
+    end
+  ' 2>/dev/null
+}
+
 ### ----------------------------------------------------------------------------
 ### 3. QUEUE ACTIONS
 ### ----------------------------------------------------------------------------
@@ -205,12 +231,14 @@ execute_auto_import() {
     return 1
   fi
 
+  local PREVIEW_URL="${FULL_URL}/api/${API_VER}/manualimport?downloadId=${DOWNLOAD_ID}&filterExistingFiles=false"
   local PREVIEW_JSON
-  PREVIEW_JSON=$(curl -sS -m 60 -H "X-Api-Key: $API_KEY" \
-    "${FULL_URL}/api/${API_VER}/manualimport?downloadId=${DOWNLOAD_ID}&filterExistingFiles=true")
+  PREVIEW_JSON=$(curl -sS -m 60 -H "X-Api-Key: $API_KEY" "$PREVIEW_URL")
 
   if ! echo "$PREVIEW_JSON" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
-    log_msg "WARN" "[$LABEL] ManualImport preview returned no eligible files for '$TITLE'."
+    local SNIPPET
+    SNIPPET=$(echo "$PREVIEW_JSON" | tr '\n' ' ' | head -c 180)
+    log_msg "WARN" "[$LABEL] ManualImport preview returned no eligible files for '$TITLE' (resp: ${SNIPPET:-empty})."
     return 1
   fi
 
@@ -259,6 +287,32 @@ execute_auto_import() {
         downloadId: .downloadId
       }]
     ')
+
+    if [[ -z "$FILES_PAYLOAD" || "$FILES_PAYLOAD" == "[]" ]]; then
+      local EP_LIST_JSON
+      EP_LIST_JSON=$(curl -sS -m 30 -H "X-Api-Key: $API_KEY" "${FULL_URL}/api/${API_VER}/episode?seriesId=${TARGET_ID}")
+      if echo "$EP_LIST_JSON" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        FILES_PAYLOAD=$(echo "$PREVIEW_JSON" | jq -c --argjson sid "$TARGET_ID" --argjson eps "$EP_LIST_JSON" '
+          [.[] |
+            ((.relativePath // .path // "") | (capture("[Ss](?<snum>[0-9]{1,2})[Ee](?<enum>[0-9]{1,3})") // capture("(?<snum>[0-9]{1,2})x(?<enum>[0-9]{2,3})"))) as $m |
+            ($m.snum | tonumber) as $s |
+            ($m.enum | tonumber) as $e |
+            ([$eps[] | select(.seasonNumber == $s and .episodeNumber == $e) | .id]) as $epIds |
+            select(($epIds | length) > 0) | {
+              path: .path,
+              folderName: .folderName,
+              seriesId: $sid,
+              episodeIds: $epIds,
+              quality: .quality,
+              languages: .languages,
+              releaseGroup: (.releaseGroup // ""),
+              indexerFlags: (.indexerFlags // 0),
+              downloadId: .downloadId
+            }
+          ]
+        ' 2>/dev/null)
+      fi
+    fi
   elif [[ "$APP_TYPE" == "lidarr" ]]; then
     FILES_PAYLOAD=$(echo "$PREVIEW_JSON" | jq -c --argjson aid "$TARGET_ID" --arg subid "$SECONDARY_ID" '
       [.[] |
@@ -298,7 +352,7 @@ execute_auto_import() {
   fi
 
   if [[ -z "$FILES_PAYLOAD" || "$FILES_PAYLOAD" == "[]" ]]; then
-    log_msg "WARN" "[$LABEL] No mappable files/tracks built for '$TITLE'."
+    log_msg "WARN" "[$LABEL] No mappable files/tracks built for '$TITLE' (targetId: $TARGET_ID)."
     return 1
   fi
 
@@ -356,7 +410,7 @@ process_instance() {
   fi
   FULL_URL="${BASE_HOST}${URL_BASE}"
 
-  local QUEUE_JSON TOTAL_RECORDS
+  local QUEUE_JSON TOTAL_RECORDS COMPLETED_RECORDS
   QUEUE_JSON=$(curl -sS -m 60 -H "X-Api-Key: $API_KEY" \
     "${FULL_URL}/api/${API_VER}/queue?page=1&pageSize=1000&includeUnknownMovieItems=true&includeUnknownSeriesItems=true&includeUnknownArtistItems=true&includeUnknownAuthorItems=true")
 
@@ -366,17 +420,26 @@ process_instance() {
   fi
 
   TOTAL_RECORDS=$(echo "$QUEUE_JSON" | jq '.records | length')
-  log_msg "INFO" "[$LABEL] Scanning $TOTAL_RECORDS queue item(s) (DryRun: $DRY_RUN)..."
+  COMPLETED_RECORDS=$(echo "$QUEUE_JSON" | jq '[.records[] | select((.status // "" | ascii_downcase) == "completed")] | length')
+  log_msg "INFO" "[$LABEL] Scanning $COMPLETED_RECORDS completed item(s) out of $TOTAL_RECORDS total (DryRun: $DRY_RUN)..."
+
+  if (( COMPLETED_RECORDS == 0 )); then
+    log_msg "INFO" "[$LABEL] Finished: 0 item(s) acted on."
+    return 0
+  fi
 
   local ACTION_COUNT=0
+  local HEALTHY_ACTIVE_COUNT=0
   local SEEN_Q_IDS="|"
+  local SEEN_IMPORT_DL_IDS="|"
+  local SEEN_IMPORT_TARGETS="|"
 
   while IFS= read -r B64_ITEM; do
     [[ -z "$B64_ITEM" ]] && continue
     local ITEM
     ITEM=$(echo "$B64_ITEM" | base64 -d)
 
-    local Q_ID TITLE DOWNLOAD_ID ADDED_AT COMBINED_MSG TARGET_ID SECONDARY_ID
+    local Q_ID TITLE DOWNLOAD_ID ADDED_AT TRACKED_STATUS DETAIL_MSG COMBINED_MSG TARGET_ID SECONDARY_ID EPISODE_ID
     Q_ID=$(echo "$ITEM" | jq -r '.id')
 
     [[ "$SEEN_Q_IDS" == *"|${Q_ID}|"* ]] && continue
@@ -385,8 +448,17 @@ process_instance() {
     TITLE=$(echo "$ITEM" | jq -r '.title // "Unknown"')
     DOWNLOAD_ID=$(echo "$ITEM" | jq -r '.downloadId // ""')
     ADDED_AT=$(echo "$ITEM" | jq -r '.added // ""')
+    TRACKED_STATUS=$(echo "$ITEM" | jq -r '.trackedDownloadStatus // ""')
     TARGET_ID=$(echo "$ITEM" | jq -r '.movieId // .seriesId // .artistId // .authorId // ""')
     SECONDARY_ID=$(echo "$ITEM" | jq -r '.albumId // .bookId // ""')
+    EPISODE_ID=$(echo "$ITEM" | jq -r '.episodeId // ""')
+
+    DETAIL_MSG=$(echo "$ITEM" | jq -r '
+      [
+        (.errorMessage // ""),
+        (.statusMessages[]? | (.title // ""), (.messages[]? // ""))
+      ] | map(select(. != "")) | join(" | ")
+    ')
 
     COMBINED_MSG=$(echo "$ITEM" | jq -r '
       [
@@ -398,8 +470,19 @@ process_instance() {
       ] | map(select(. != "")) | join(" | ")
     ')
 
+    # If completed item has no explicit detail message, query /manualimport to surface hidden rejections
+    if [[ -z "$DETAIL_MSG" && -n "$DOWNLOAD_ID" && "$DOWNLOAD_ID" != "null" ]] && [[ "${TRACKED_STATUS,,}" != "ok" || "$COMBINED_MSG" == *"importBlocked"* ]]; then
+      local MI_REJECTIONS
+      MI_REJECTIONS=$(fetch_manualimport_rejections "$FULL_URL" "$API_VER" "$API_KEY" "$DOWNLOAD_ID")
+      if [[ -n "$MI_REJECTIONS" ]]; then
+        COMBINED_MSG="${COMBINED_MSG} | ManualImport: ${MI_REJECTIONS}"
+      fi
+    fi
+
     local AGE_HOURS
     AGE_HOURS=$(calc_age_hours "$ADDED_AT")
+    local HANDLED="N"
+    local SKIP_NOTES=()
 
     for RAW_RULE in "${QUEUE_RULES[@]}"; do
       split_fields "$RAW_RULE"
@@ -412,24 +495,57 @@ process_instance() {
 
       [[ "$R_EN" != "Y" ]] && continue
       app_matches_filter "$APP_TYPE" "$R_APP" || continue
-      (( AGE_HOURS < R_AGE )) && continue
 
       if printf '%s\n' "$COMBINED_MSG" | grep -Eiq -- "$R_REGEX"; then
+        if (( AGE_HOURS < R_AGE )); then
+          # Don't spam logs for young healthy items actively importing
+          if [[ "$R_ID" == "stuck_import_pending" ]]; then
+            ((HEALTHY_ACTIVE_COUNT++))
+            HANDLED="Y"
+          else
+            SKIP_NOTES+=("Matched [$R_ID] ($R_ACT) but age ${AGE_HOURS}h < min ${R_AGE}h")
+          fi
+          continue
+        fi
+
         case "$R_ACT" in
           IGNORE)
+            [[ "${LOG_ALL_DECISIONS^^}" == "Y" ]] && \
+              log_msg "INFO" "[$LABEL] [$R_ID] IGNORED '$TITLE' (Age: ${AGE_HOURS}h | Msg: $COMBINED_MSG)"
+            HANDLED="Y"
             break
             ;;
           AUTO_IMPORT)
+            local TARGET_KEY="${TARGET_ID}:${EPISODE_ID:-$SECONDARY_ID}"
+            if [[ -n "$DOWNLOAD_ID" && "$DOWNLOAD_ID" != "null" && "$SEEN_IMPORT_DL_IDS" == *"|${DOWNLOAD_ID}|"* ]]; then
+              [[ "${LOG_ALL_DECISIONS^^}" == "Y" ]] && \
+                log_msg "INFO" "[$LABEL] [$R_ID] SKIPPED duplicate downloadId for '$TITLE' (already attempted AUTO_IMPORT)"
+              HANDLED="Y"
+              break
+            fi
+            if [[ -n "$TARGET_ID" && "$TARGET_ID" != "null" && "$SEEN_IMPORT_TARGETS" == *"|${TARGET_KEY}|"* ]]; then
+              [[ "${LOG_ALL_DECISIONS^^}" == "Y" ]] && \
+                log_msg "INFO" "[$LABEL] [$R_ID] SKIPPED duplicate target ($TARGET_KEY) for '$TITLE' (already imported another release this run)"
+              HANDLED="Y"
+              break
+            fi
+
             execute_auto_import "$FULL_URL" "$API_VER" "$API_KEY" "$APP_TYPE" \
               "$DOWNLOAD_ID" "$TARGET_ID" "$SECONDARY_ID" "$LABEL" "$TITLE" "$DRY_RUN"
             local IMP_RC=$?
+            [[ -n "$DOWNLOAD_ID" && "$DOWNLOAD_ID" != "null" ]] && SEEN_IMPORT_DL_IDS="${SEEN_IMPORT_DL_IDS}${DOWNLOAD_ID}|"
+
             if [[ $IMP_RC -eq 0 ]]; then
+              [[ -n "$TARGET_ID" && "$TARGET_ID" != "null" ]] && SEEN_IMPORT_TARGETS="${SEEN_IMPORT_TARGETS}${TARGET_KEY}|"
               ((ACTION_COUNT++))
               [[ "$DRY_RUN" == "N" ]] && sleep 2
+              HANDLED="Y"
               break
             elif [[ $IMP_RC -eq 2 ]]; then
+              SKIP_NOTES+=("Matched [$R_ID] (AUTO_IMPORT) but skipped due to secondary rejection")
               continue
             else
+              HANDLED="Y"
               break
             fi
             ;;
@@ -442,17 +558,19 @@ process_instance() {
               log_msg "SUCCESS" "[$LABEL] [$R_ID] REMOVED '$TITLE' (HTTP $CODE)"
             fi
             ((ACTION_COUNT++))
+            HANDLED="Y"
             break
             ;;
           REMOVE_AND_SEARCH)
             if [[ "$DRY_RUN" == "Y" ]]; then
-              log_msg "INFO" "[$LABEL] [DRY RUN] [$R_ID] Would REMOVE + RE-SEARCH '$TITLE' (Age: ${AGE_HOURS}h)"
+              log_msg "INFO" "[$LABEL] [DRY RUN] [$R_ID] Would REMOVE + RE-SEARCH '$TITLE' (Age: ${AGE_HOURS}h | Msg: $COMBINED_MSG)"
             else
               local CODE
               CODE=$(execute_queue_delete "$FULL_URL" "$API_VER" "$API_KEY" "$Q_ID" "false" "false")
               log_msg "SUCCESS" "[$LABEL] [$R_ID] REMOVED + RE-SEARCHED '$TITLE' (HTTP $CODE)"
             fi
             ((ACTION_COUNT++))
+            HANDLED="Y"
             break
             ;;
           BLOCKLIST_AND_SEARCH)
@@ -464,25 +582,42 @@ process_instance() {
               log_msg "SUCCESS" "[$LABEL] [$R_ID] BLOCKLISTED + RE-SEARCHED '$TITLE' (HTTP $CODE)"
             fi
             ((ACTION_COUNT++))
+            HANDLED="Y"
             break
             ;;
           BLOCKLIST_ONLY)
             if [[ "$DRY_RUN" == "Y" ]]; then
-              log_msg "INFO" "[$LABEL] [DRY RUN] [$R_ID] Would BLOCKLIST (no re-search) '$TITLE' (Age: ${AGE_HOURS}h)"
+              log_msg "INFO" "[$LABEL] [DRY RUN] [$R_ID] Would BLOCKLIST (no re-search) '$TITLE' (Age: ${AGE_HOURS}h | Msg: $COMBINED_MSG)"
             else
               local CODE
               CODE=$(execute_queue_delete "$FULL_URL" "$API_VER" "$API_KEY" "$Q_ID" "true" "true")
               log_msg "SUCCESS" "[$LABEL] [$R_ID] BLOCKLISTED '$TITLE' (HTTP $CODE)"
             fi
             ((ACTION_COUNT++))
+            HANDLED="Y"
             break
             ;;
         esac
       fi
     done
-  done < <(echo "$QUEUE_JSON" | jq -r '.records[] | @base64')
 
-  log_msg "INFO" "[$LABEL] Finished: $ACTION_COUNT item(s) matched rules."
+    if [[ "$HANDLED" == "N" && "${LOG_ALL_DECISIONS^^}" == "Y" ]]; then
+      if (( ${#SKIP_NOTES[@]} > 0 )); then
+        local JOINED_NOTES
+        JOINED_NOTES=$(printf '%s; ' "${SKIP_NOTES[@]}")
+        log_msg "INFO" "[$LABEL] [NO_ACTION] '$TITLE' — ${JOINED_NOTES%??} (Msg: $COMBINED_MSG)"
+      else
+        log_msg "INFO" "[$LABEL] [UNMATCHED] '$TITLE' — No rules matched (Age: ${AGE_HOURS}h | Msg: $COMBINED_MSG)"
+      fi
+    fi
+
+  done < <(echo "$QUEUE_JSON" | jq -r '.records[] | select((.status // "" | ascii_downcase) == "completed") | @base64')
+
+  if (( HEALTHY_ACTIVE_COUNT > 0 )) && [[ "${LOG_ALL_DECISIONS^^}" == "Y" ]]; then
+    log_msg "INFO" "[$LABEL] [ACTIVE_IMPORTS] Skipped $HEALTHY_ACTIVE_COUNT healthy item(s) actively importing (< 24h old)."
+  fi
+
+  log_msg "INFO" "[$LABEL] Finished: $ACTION_COUNT item(s) acted on."
 }
 
 ### ----------------------------------------------------------------------------
@@ -491,7 +626,7 @@ process_instance() {
 
 [[ -n "$LOG_FILE" ]] && mkdir -p "$(dirname "$LOG_FILE")"
 rotate_log
-log_msg "INFO" "=== Starting Multi-Arr Queue Cleaner ${SCRIPT_VERSION} (Global DryRun: $GLOBAL_DRY_RUN) ==="
+log_msg "INFO" "=== Starting Multi-Arr Queue Cleaner ${SCRIPT_VERSION} (Global DryRun: $GLOBAL_DRY_RUN | LogAll: $LOG_ALL_DECISIONS) ==="
 
 for ENTRY in "${ARR_INSTANCES[@]}"; do
   [[ -z "$(trim "$ENTRY")" ]] && continue
