@@ -1,0 +1,242 @@
+#!/bin/bash
+##### ======================================================================================
+##### SCRIPT: Sonarr Missing Season Search Trigger
+##### VERSION: v1.2 (Auto-UrlBase + Single-Endpoint Missing Fetch)
+##### DESCRIPTION: Queries Sonarr for monitored missing episodes (with embedded series
+#####              metadata), deduplicates unique (Series + Season) pairs, and triggers
+#####              SeasonSearch commands in rate-limited batches with cooldown tracking.
+##### ======================================================================================
+
+##### --------------------------------------------------------------------------------------
+##### 1.0 USER CONFIGURATION
+##### --------------------------------------------------------------------------------------
+SCRIPT_VERSION="v1.2"
+SONARR_HOST="http://192.168.1.1:8989"                                     # Base host:port (UrlBase is auto-detected from config.xml)
+SONARR_CONFIG="/mnt/cache/appdata/sonarr/config.xml"
+SONARR_API_KEY=""                                                         # Leave blank to auto-read from config.xml
+
+# Search Behavior & Rate Limiting
+SKIP_SPECIALS="true"                                                      # "true" to ignore Season 0, "false" to include
+MAX_SEASONS_PER_RUN=0                                                     # Cap searches per run (0 = unlimited) to protect Prowlarr
+DELAY_SECONDS=5                                                           # Pause between SeasonSearch API calls
+COOLDOWN_HOURS=24                                                         # Skip seasons already searched within this many hours
+CURL_TIMEOUT=180                                                          # Timeout in seconds for large API responses
+DRY_RUN="N"                                                               # "Y" to log what would be searched without triggering
+
+# State, Logging & Lockfile
+BASE_DIR="/mnt/cache/appdata/other/scripts/sonarr"
+STATE_FILE="${BASE_DIR}/season_search_history.db"
+LOG_FILE="${BASE_DIR}/season_search.log"
+LOCKFILE="/var/run/sonarr_missing_season_search.lock"
+ENABLE_NOTIFY="true"                                                      # Send Unraid summary notification on completion
+
+##### --------------------------------------------------------------------------------------
+##### 2.0 INITIALIZATION & GUARDS
+##### --------------------------------------------------------------------------------------
+mkdir -p "$BASE_DIR"
+
+log_step() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg" | tee -a "$LOG_FILE"
+}
+
+send_notification() {
+    [[ "$ENABLE_NOTIFY" != "true" ]] && return 0
+    /usr/local/emhttp/webGui/scripts/notify -e "Sonarr Season Search" -s "$1" -d "$2" -i "$3" 2>/dev/null || true
+}
+
+cleanup() {
+    flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM HUP
+
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    log_step "[ABORT] Script is already running (PID $(cat "$LOCKFILE" 2>/dev/null)). Exiting."
+    exit 1
+fi
+echo $$ >&9
+
+# Guard 1: Defer during CA Appdata Backup
+if pgrep -f "appdata.backup" >/dev/null 2>&1 || [ -f "/tmp/appdata.backup/running" ]; then
+    log_step "[SKIP] CA Appdata Backup is active. Deferring."
+    exit 0
+fi
+
+# Guard 2: Defer during Monthly Media Maintenance
+if [ -f "/var/run/media_maintenance.lock" ]; then
+    log_step "[SKIP] Media Maintenance lockfile active. Deferring."
+    exit 0
+fi
+
+# Guard 3: Ensure Sonarr container is running
+if [[ "$(docker inspect -f '{{.State.Running}}' sonarr 2>/dev/null)" != "true" ]]; then
+    log_step "[SKIP] Sonarr container is not running. Exiting."
+    exit 0
+fi
+
+# Verify jq is available
+if ! command -v jq >/dev/null 2>&1; then
+    log_step "[ERROR] 'jq' is not installed on the host. Exiting."
+    exit 1
+fi
+
+# Auto-extract API key and UrlBase from config.xml
+URL_BASE=""
+if [[ -f "$SONARR_CONFIG" ]]; then
+    if [[ -z "$SONARR_API_KEY" ]]; then
+        SONARR_API_KEY=$(sed -n 's/.*<ApiKey>\(.*\)<\/ApiKey>.*/\1/p' "$SONARR_CONFIG" | tr -d '[:space:]')
+    fi
+    RAW_BASE=$(sed -n 's/.*<UrlBase>\(.*\)<\/UrlBase>.*/\1/p' "$SONARR_CONFIG" | tr -d '[:space:]')
+    if [[ -n "$RAW_BASE" && "$RAW_BASE" != "/" ]]; then
+        URL_BASE="/${RAW_BASE#/}"
+        URL_BASE="${URL_BASE%/}"
+    fi
+fi
+
+if [[ -z "$SONARR_API_KEY" ]]; then
+    log_step "[ERROR] Could not resolve Sonarr API key. Check SONARR_CONFIG or set SONARR_API_KEY."
+    exit 1
+fi
+
+touch "$STATE_FILE"
+URL_CLEAN="${SONARR_HOST%/}${URL_BASE}"
+
+##### --------------------------------------------------------------------------------------
+##### 3.0 FETCH MISSING EPISODES & DEDUPLICATE SEASONS
+##### --------------------------------------------------------------------------------------
+log_step "======================================================================================"
+log_step "STARTING: Sonarr Missing Season Search ($SCRIPT_VERSION) | Dry Run: $DRY_RUN"
+log_step "Target: $URL_CLEAN | Max/Run: $MAX_SEASONS_PER_RUN | Delay: ${DELAY_SECONDS}s | Cooldown: ${COOLDOWN_HOURS}h"
+log_step "======================================================================================"
+
+# 1. Load non-expired cooldown entries into associative array
+NOW_TS=$(date +%s)
+COOLDOWN_SEC=$((COOLDOWN_HOURS * 3600))
+declare -A HISTORY
+
+while IFS='|' read -r hkey hts; do
+    if [[ -n "$hkey" ]] && [[ "$hts" =~ ^[0-9]+$ ]]; then
+        if (( NOW_TS - hts < COOLDOWN_SEC )); then
+            HISTORY["$hkey"]="$hts"
+        fi
+    fi
+done < "$STATE_FILE"
+
+# 2. Paginate through /api/v3/wanted/missing (with includeSeries=true so titles come inline)
+declare -A SEASON_COUNTS
+declare -A SERIES_TITLES
+PAGE=1
+PAGE_SIZE=500
+
+while true; do
+    TMP_RESP=$(mktemp)
+    CURL_ERR=$(curl -sS -m "$CURL_TIMEOUT" -w "%{http_code}" -o "$TMP_RESP" \
+        -H "X-Api-Key: $SONARR_API_KEY" \
+        "${URL_CLEAN}/api/v3/wanted/missing?page=${PAGE}&pageSize=${PAGE_SIZE}&monitored=true&includeSeries=true&sortKey=seriesId&sortDirection=ascending" 2>&1)
+    CURL_RC=$?
+    HTTP_STATUS="${CURL_ERR: -3}"
+
+    if [[ $CURL_RC -ne 0 || "$HTTP_STATUS" != "200" ]]; then
+        log_step "[ERROR] Failed fetching missing page $PAGE (curl rc=$CURL_RC, HTTP=$HTTP_STATUS): $CURL_ERR"
+        rm -f "$TMP_RESP"
+        exit 1
+    fi
+
+    TOTAL_RECORDS=$(jq -r '.totalRecords // 0' "$TMP_RESP")
+    RECORD_COUNT=$(jq -r '.records | length' "$TMP_RESP")
+
+    if [[ "$PAGE" -eq 1 ]]; then
+        log_step "Sonarr reports $TOTAL_RECORDS total monitored missing episodes."
+    fi
+
+    if [[ "$RECORD_COUNT" -eq 0 ]]; then
+        rm -f "$TMP_RESP"
+        break
+    fi
+
+    while IFS=$'\t' read -r sid snum stitle; do
+        [[ -z "$sid" || -z "$snum" ]] && continue
+        if [[ "$SKIP_SPECIALS" == "true" && "$snum" -eq 0 ]]; then
+            continue
+        fi
+        key="${sid}:${snum}"
+        SEASON_COUNTS["$key"]=$(( ${SEASON_COUNTS["$key"]:-0} + 1 ))
+        if [[ -n "$stitle" && -z "${SERIES_TITLES[$sid]}" ]]; then
+            SERIES_TITLES["$sid"]="$stitle"
+        fi
+    done < <(jq -r '.records[] | "\(.seriesId)\t\(.seasonNumber)\t\(.series.title // "")"' "$TMP_RESP")
+
+    rm -f "$TMP_RESP"
+
+    if (( PAGE * PAGE_SIZE >= TOTAL_RECORDS )); then
+        break
+    fi
+    ((PAGE++))
+done
+
+TOTAL_CANDIDATES=${#SEASON_COUNTS[@]}
+log_step "Found $TOTAL_CANDIDATES unique seasons with monitored missing episodes."
+
+##### --------------------------------------------------------------------------------------
+##### 4.0 TRIGGER SEASON SEARCHES
+##### --------------------------------------------------------------------------------------
+TRIGGERED=0
+SKIPPED_COOLDOWN=0
+
+SORTED_KEYS=$(printf "%s\n" "${!SEASON_COUNTS[@]}" | sort -t: -k1,1n -k2,2n)
+
+while IFS= read -r key; do
+    [[ -z "$key" ]] && continue
+
+    if [[ -n "${HISTORY[$key]}" ]]; then
+        ((SKIPPED_COOLDOWN++))
+        continue
+    fi
+
+    if (( MAX_SEASONS_PER_RUN > 0 && TRIGGERED >= MAX_SEASONS_PER_RUN )); then
+        log_step "[LIMIT] Reached MAX_SEASONS_PER_RUN ($MAX_SEASONS_PER_RUN). Remaining seasons will run next cycle."
+        break
+    fi
+
+    SID="${key%%:*}"
+    SNUM="${key##*:}"
+    MISSING_CNT="${SEASON_COUNTS[$key]}"
+    TITLE="${SERIES_TITLES[$SID]:-Series $SID}"
+    SNUM_PAD=$(printf "%02d" "$SNUM")
+
+    if [[ "${DRY_RUN^^}" == "Y" ]]; then
+        log_step "[DRY RUN] Would trigger SeasonSearch -> $TITLE | Season $SNUM_PAD ($MISSING_CNT missing eps)"
+        ((TRIGGERED++))
+    else
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 30 \
+            -X POST "${URL_CLEAN}/api/v3/command" \
+            -H "X-Api-Key: $SONARR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"SeasonSearch\", \"seriesId\": $SID, \"seasonNumber\": $SNUM}")
+
+        if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
+            log_step "[TRIGGERED] SeasonSearch -> $TITLE | Season $SNUM_PAD ($MISSING_CNT missing eps)"
+            HISTORY["$key"]=$(date +%s)
+            ((TRIGGERED++))
+            sleep "$DELAY_SECONDS"
+        else
+            log_step "[WARN] Failed SeasonSearch for $TITLE S$SNUM_PAD (HTTP $HTTP_CODE)"
+        fi
+    fi
+done <<< "$SORTED_KEYS"
+
+# Persist updated cooldown state
+if [[ "${DRY_RUN^^}" != "Y" ]]; then
+    : > "$STATE_FILE"
+    for k in $(printf "%s\n" "${!HISTORY[@]}" | sort -t: -k1,1n -k2,2n); do
+        echo "${k}|${HISTORY[$k]}" >> "$STATE_FILE"
+    done
+fi
+
+SUMMARY="Triggered $TRIGGERED season searches ($SKIPPED_COOLDOWN on cooldown, $TOTAL_CANDIDATES total candidate seasons)."
+log_step "SUMMARY: $SUMMARY"
+send_notification "Sonarr Season Search" "$SUMMARY" "normal"
+log_step "COMPLETE: $SUMMARY"
+exit 0
