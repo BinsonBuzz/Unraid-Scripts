@@ -1,0 +1,132 @@
+#!/bin/bash
+# ======================================================================================
+# SCRIPT: The Janitor (Array Shutdown Orchestrator)
+# VERSION: v1.15 (Comprehensive Lock & State Purge)
+# UPDATED: 18.09.2026
+# DESCRIPTION: Ensures a clean Unraid shutdown by resetting startup flags, stopping
+#              consumers cleanly, unmounting FUSE cloud paths, flushing databases,
+#              lazy-unmounting local bind-mounts, exporting ZFS pools safely, and
+#              purging all system & script lock files (/var/run/*.lock, *.lck, prime_state.db).
+#              Fully synchronized with the v7.17 startup script.
+# ======================================================================================
+
+# --------------------------------------------------------------------------------------
+# 1. USER CONFIGURATION
+# --------------------------------------------------------------------------------------
+BASE_SCRIPT_DIR="/mnt/cache/appdata/other/scripts"
+LOG_FILE="${BASE_SCRIPT_DIR}/shutdown/shutdown.log"
+
+# --- DATABASE SETTINGS ---
+PG_CONTAINERS=("postgresql16" "silo_postgres")
+PG_FLUSH_TIME="60"
+
+# --- MOUNT & BRIDGE SETTINGS ---
+RC_PORT="5573"
+CLOUD_MOUNTS=("/mnt/cache/streaming/nzbdav" "/mnt/cache/streaming/decypharr")
+
+# --- ZFS POOLS (Synced with v7.17 Startup) ---
+ZFS_POOLS=("cache" "computers")
+
+# --------------------------------------------------------------------------------------
+# 2. MAIN SCRIPT
+# --------------------------------------------------------------------------------------
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log_step() {
+    local MSG="$1"
+    echo "[$(date '+%H:%M:%S')] INFO: $MSG" | tee -a "$LOG_FILE"
+}
+
+log_step "--- COMMENCING CLEAN ARRAY SHUTDOWN (v1.15) ---"
+
+# --- STAGE 0: STATE RESET (BOOT-SYNC INTEROPERABILITY) ---
+log_step "Resetting global startup and readiness flags..."
+rm -f /var/run/highlander_ready
+rm -f /var/run/master_startup.lock
+rm -f /var/run/*.lock 2>/dev/null
+log_step "SUCCESS: Startup state variables cleared and reset."
+
+# --- STAGE 1: RAM FLUSH ---
+log_step "FORCING RAM FLUSH: Writing active buffers to disk..."
+sync
+log_step "SUCCESS: RAM buffers committed to storage."
+
+# --- STAGE 1b: KILL WATCHDOGS & HEARTBEATS ---
+log_step "Terminating background watchdog, heartbeat, and sentinel monitors..."
+timeout 10s pkill -f "Rclone Mount Heartbeat" > /dev/null 2>&1 || log_step "WARNING: 'Rclone Mount Heartbeat' termination timed out."
+log_step "SUCCESS: Background monitor loops halted."
+
+# --- STAGE 2: STOP MEDIA CONSUMERS FIRST ---
+log_step "Stopping media players, indexing consumers, and AI servers cleanly..."
+docker stop plex emby komga posterizarr kometa tautulli seerr wizarr radarr sonarr lidarr prowlarr bazarr chaptarr silo_server autopulse houndarr > /dev/null 2>&1
+log_step "SUCCESS: High-level consumer containers stopped."
+
+# --- STAGE 3: FORCE CLOUD UNMOUNTS (WHILE DAEMONS ARE STILL ALIVE) ---
+log_step "Forcing lazy unmount of active FUSE cloud paths..."
+for cloud_path in "${CLOUD_MOUNTS[@]}"; do
+    umount -l "$cloud_path" > /dev/null 2>&1
+    fusermount -uz "$cloud_path" > /dev/null 2>&1
+    log_step "SUCCESS: Forced lazy unmount of cloud path: $cloud_path"
+done
+
+# --- STAGE 4: STOP MOUNT ENGINES & FLUSH DATABASES ---
+for pg_container in "${PG_CONTAINERS[@]}"; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$pg_container" 2>/dev/null)" = "true" ]; then
+        log_step "Signaling database $pg_container to flush and stop cleanly ($PG_FLUSH_TIME seconds)..."
+        docker stop -t "$PG_FLUSH_TIME" "$pg_container" > /dev/null 2>&1
+        log_step "SUCCESS: Database flush and stop complete for $pg_container."
+    fi
+done
+
+log_step "Stopping all remaining containers (including Decypharr and nzbdav)..."
+docker stop $(docker ps -q) > /dev/null 2>&1
+log_step "SUCCESS: All remaining Docker containers stopped."
+
+# --- STAGE 5: BIND BRIDGES ---
+log_step "Unmounting local bind bridges..."
+for dest in "${BINDS[@]}"; do
+    if mountpoint -q "$dest"; then
+        if umount -l "$dest" > /dev/null 2>&1; then
+            log_step "SUCCESS: Unmounted bind bridge: $dest"
+        else
+            log_step "WARNING: Failed to unmount $dest (Device busy)"
+        fi
+    fi
+done
+
+# --- STAGE 5b: TERMINATE RCLONE PROCESSES & PORTS ---
+log_step "Terminating orphaned Rclone processes and clearing Port $RC_PORT..."
+timeout 10s killall -9 rclone > /dev/null 2>&1 || log_step "WARNING: rclone termination timed out."
+timeout 10s fuser -k "$RC_PORT/tcp" > /dev/null 2>&1 || log_step "WARNING: Port $RC_PORT clearing timed out."
+log_step "SUCCESS: Rclone environment cleared."
+
+# --- STAGE 6: ZFS POOL EXPORT ---
+log_step "HARD LOCKDOWN: Disabling Docker and VM engines to release ZFS handles..."
+/etc/rc.d/rc.docker stop >/dev/null 2>&1
+/etc/rc.d/rc.libvirt stop >/dev/null 2>&1
+
+if [ ${#ZFS_POOLS[@]} -gt 0 ]; then
+    for pool in "${ZFS_POOLS[@]}"; do
+        log_step "Exporting ZFS Pool: $pool..."
+        if timeout 15s zpool export -f "$pool" > /dev/null 2>&1; then
+            log_step "SUCCESS: ZFS Pool $pool exported."
+        else
+            log_step "CRITICAL: Pool $pool busy or export timed out; manual intervention may be needed."
+        fi
+    done
+fi
+
+# --- STAGE 7: CLEANUP & NOTIFY ---
+log_step "Deep purging all script lock files and Rclone state..."
+rm -f /var/run/*.lock 2>/dev/null
+find "$BASE_SCRIPT_DIR" -type f \( -name "*.lock" -o -name "*.lck" -o -name "prime_state.db" \) -delete
+log_step "SUCCESS: All system/script lock files (.lock, .lck) and Rclone state purged."
+
+/usr/local/emhttp/webGui/scripts/notify \
+    -e "Server Status" \
+    -s "Shutdown Prepared" \
+    -d "v1.15 Global Script Cleanup Complete." \
+    -i "normal"
+
+log_step "--- JANITOR WORK COMPLETE ---" | tee -a "$LOG_FILE"
+exit 0
