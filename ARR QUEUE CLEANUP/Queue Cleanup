@@ -1,6 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # MULTI-ARR SMART QUEUE CLEANER & AUTO-IMPORTER (Unraid User Scripts)
+# VERSION: v0.7
 # Supports: Radarr, Sonarr, Lidarr, Chaptarr, Readarr, Whisparr (multiple instances)
 # ==============================================================================
 
@@ -8,6 +9,7 @@
 ### 1. USER CONFIGURATION
 ### ----------------------------------------------------------------------------
 
+SCRIPT_VERSION="v0.7"
 LOG_FILE="/mnt/user/appdata/other/scripts/arrs/arr_queue_cleaner.log"
 MAX_LOG_LINES=2000
 
@@ -21,10 +23,10 @@ GLOBAL_DRY_RUN="Y"
 # Format: "Label :: AppType :: BaseHost :: ConfigXMLPath :: DryRun(Y/N)"
 # AppType: radarr | sonarr | lidarr | chaptarr | readarr | whisparr
 ARR_INSTANCES=(
-  "Radarr   :: radarr   :: http://192.168.1.1:7878 :: /mnt/computers/appdata_media/dockers/radarr/config.xml   :: Y"
-  "Sonarr   :: sonarr   :: http://192.168.1.1:8989 :: /mnt/computers/appdata_media/dockers/sonarr/config.xml   :: Y"
-  "Lidarr   :: lidarr   :: http://192.168.1.1:8686 :: /mnt/computers/appdata_media/dockers/lidarr/config.xml   :: Y"
-  "Chaptarr :: chaptarr :: http://192.168.1.1:8789 :: /mnt/computers/appdata_media/dockers/chaptarr/config.xml :: Y"
+  "Radarr   :: radarr   :: http://192.168.1.1:7878 :: /mnt/computers/appdata_media/dockers/radarr/config.xml   :: N"
+  "Sonarr   :: sonarr   :: http://192.168.1.1:8989 :: /mnt/computers/appdata_media/dockers/sonarr/config.xml   :: N"
+  "Lidarr   :: lidarr   :: http://192.168.1.1:8686 :: /mnt/computers/appdata_media/dockers/lidarr/config.xml   :: N"
+  "Chaptarr :: chaptarr :: http://192.168.1.1:8789 :: /mnt/computers/appdata_media/dockers/chaptarr/config.xml :: N"
   # Add extra instances easily, e.g.:
   # "Radarr-4K :: radarr :: http://192.168.1.1:7879 :: /mnt/computers/appdata_media/dockers/radarr4k/config.xml :: Y"
 )
@@ -54,8 +56,8 @@ QUEUE_RULES=(
   # 2b. Chaptarr/Readarr split:
   #     - Same book title across duplicate metadata editions (e.g., Goodreads vs Hardcover) -> AUTO_IMPORT
   #     - Different book title / omnibus anthology -> BLOCKLIST_AND_SEARCH
-  "book_edition_mismatch :: Y :: chaptarr,readarr                       :: 0  :: grabbed for '([^']+)' \(BookId [0-9]+, [^)]+\), but import matched '\1'   :: AUTO_IMPORT"
-  "book_wrong_or_omnibus :: Y :: chaptarr,readarr                       :: 0  :: Completed download was grabbed for .* but import matched                   :: BLOCKLIST_AND_SEARCH"
+  "book_edition_mismatch :: Y :: chaptarr,readarr                        :: 0  :: grabbed for '([^']+)' \(BookId [0-9]+, [^)]+\), but import matched '\1'   :: AUTO_IMPORT"
+  "book_wrong_or_omnibus :: Y :: chaptarr,readarr                        :: 0  :: Completed download was grabbed for .* but import matched                   :: BLOCKLIST_AND_SEARCH"
 
   # 3. Lidarr partial / mismatched albums
   "album_low_match       :: Y :: lidarr                                 :: 0  :: Album match is not close enough                                            :: BLOCKLIST_AND_SEARCH"
@@ -66,8 +68,9 @@ QUEUE_RULES=(
   "invalid_ep_stale      :: N :: sonarr                                 :: 48 :: Invalid season or episode                                                  :: REMOVE"
 
   # 5. Missing episodes / empty / sample-only releases
-  "ep_not_found          :: Y :: sonarr                                 :: 48 :: was not found in the grabbed release|Episodes not imported                  :: BLOCKLIST_AND_SEARCH"
+  "ep_not_found          :: Y :: sonarr                                 :: 48 :: was not found in the grabbed release|Episodes not imported                 :: BLOCKLIST_AND_SEARCH"
   "no_eligible_files     :: Y :: *                                      :: 48 :: No files found are eligible for import                                     :: BLOCKLIST_AND_SEARCH"
+  "sample_indeterminate  :: Y :: *                                      :: 0  :: Unable to determine if file is a sample                                    :: BLOCKLIST_AND_SEARCH"
   "sample_only           :: Y :: *                                      :: 0  :: Sample                                                                     :: BLOCKLIST_AND_SEARCH"
   "file_empty            :: Y :: *                                      :: 0  :: Downloaded file is empty                                                   :: BLOCKLIST_AND_SEARCH"
   "unable_to_parse       :: N :: *                                      :: 0  :: Unable to parse download                                                   :: BLOCKLIST_AND_SEARCH"
@@ -488,7 +491,7 @@ process_instance() {
 
 [[ -n "$LOG_FILE" ]] && mkdir -p "$(dirname "$LOG_FILE")"
 rotate_log
-log_msg "INFO" "=== Starting Multi-Arr Queue Cleaner (Global DryRun: $GLOBAL_DRY_RUN) ==="
+log_msg "INFO" "=== Starting Multi-Arr Queue Cleaner ${SCRIPT_VERSION} (Global DryRun: $GLOBAL_DRY_RUN) ==="
 
 for ENTRY in "${ARR_INSTANCES[@]}"; do
   [[ -z "$(trim "$ENTRY")" ]] && continue
@@ -496,3 +499,4 @@ for ENTRY in "${ARR_INSTANCES[@]}"; do
 done
 
 log_msg "INFO" "=== Queue Cleaner Complete ==="
+exit 0
