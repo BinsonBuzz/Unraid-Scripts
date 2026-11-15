@@ -1,0 +1,369 @@
+#!/bin/bash
+##### ======================================================================================
+##### SCRIPT: Native Storage & Media Stack Heartbeat
+##### VERSION: v2.3-Native (Rclone-Free Storage, Container Sentinel & Daily Auto-Update)
+##### DESCRIPTION: Audits and auto-heals native FUSE/DFS mounts (Infinidysk V2 & Decypharr),
+#####              manages scheduled once-a-day container stack auto-updates, and ensures
+#####              downstream client application containers remain active.
+##### ======================================================================================
+
+##### --------------------------------------------------------------------------------------
+##### 1.0 USER CONFIGURATION
+##### ------------------------ --------------------------------------------------------------
+
+##### --- 1.1 SCRIPT & STORAGE PATHS ---
+# Paths for persistent state tracking, logging, and process lock files.
+SCRIPT_VERSION="v2.3-Native"
+STATE_FILE="/mnt/cache/appdata/other/scripts/storage/native_state.db"     # File used to store mount state across runs
+LOG_FILE="/mnt/cache/appdata/other/scripts/storage/native_heartbeat.log"   # Log file destination for heartbeat operations
+LOCKFILE="/var/run/native_storage_heartbeat.lock"                         # Lockfile path to prevent overlapping executions
+FORCE_RESET="N"                                                           # Default flag for forced reset mode ("Y" or "N")
+
+##### --- 1.2 NATIVE STORAGE MOUNT PATHS ---
+# Host mount points and container targets for native Infinidysk V2 and Decypharr storage.
+NZBDAV_CONTAINER="nzbdav"                                                 # Container name for Infinidysk V2
+MOUNT_PATH="/mnt/cache/streaming/nzbdav"                                  # Infinidysk V2 native mount point
+DECYPHAR_CONTAINER="Decypharr"                                            # Container name for Decypharr
+DECYPH_PATH="/mnt/cache/streaming/decypharr"                              # Decypharr native mount point
+
+##### --- 1.3 DOCKER & CONTAINER RESTORATION SETTINGS ---
+# Space-separated list of client application containers dependent on active storage mounts.
+CONTAINERS="postgresql16 autopulse notifiarr homeassistant plex chaptarr houndarr lidarr prowlarr radarr sonarr emby scrob silo_ollama silo_whisper silo_server"
+
+# Compose project mapping for clean restoration
+declare -A CONTAINER_PROJECTS=(
+  # Autostart Stack
+  ["postgresql16"]="/mnt/cache/appdata/projects/0_autostart"
+
+  # 12-15 Stack
+  ["chaptarr"]="/mnt/cache/appdata/projects/12-15"
+  ["houndarr"]="/mnt/cache/appdata/projects/12-15"
+  ["lidarr"]="/mnt/cache/appdata/projects/12-15"
+  ["notifiarr"]="/mnt/cache/appdata/projects/OS"
+  ["prowlarr"]="/mnt/cache/appdata/projects/12-15"
+  ["radarr"]="/mnt/cache/appdata/projects/12-15"
+  ["sonarr"]="/mnt/cache/appdata/projects/12-15"
+
+  # Home Stack
+  ["autopulse"]="/mnt/cache/appdata/projects/home"
+  ["emby"]="/mnt/cache/appdata/projects/home"
+  ["homeassistant"]="/mnt/cache/appdata/projects/home"
+  ["plex"]="/mnt/cache/appdata/projects/home"
+  ["scrob"]="/mnt/cache/appdata/projects/home"
+
+  # Silo Stack
+  ["silo_ollama"]="/mnt/cache/appdata/projects/htpc"
+  ["silo_server"]="/mnt/cache/appdata/projects/htpc"
+  ["silo_whisper"]="/mnt/cache/appdata/projects/htpc"
+)
+
+##### --- 1.4 DAILY CONTAINER AUTO-UPDATE SETTINGS ---
+ENABLE_AUTO_UPDATE="true"                                                 # Master toggle for scheduled container auto-updates ("true"/"false")
+UPDATE_TIME="04:00"                                                      # Target update window in 24-hour HH:MM format
+UPDATE_STATE_FILE="/mnt/cache/appdata/other/scripts/storage/last_container_update.date" # Token file tracking last update date
+
+##### --------------------------------------------------------------------------------------
+##### 2.0 INITIALIZATION & ENVIRONMENT READINESS
+##### --------------------------------------------------------------------------------------
+
+##### --- 2.1 HELPER FUNCTIONS & SIGNAL HANDLING ---
+log_step() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+
+send_notification() {
+  local subject="$1" message="$2" importance="$3"
+  /usr/local/emhttp/webGui/scripts/notify -e "Native Storage Heartbeat" -s "$subject" -d "$message" -i "$importance" 2>/dev/null || true
+}
+
+is_container_running() {
+  local name="$1"
+  [[ -n "$name" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" == "true" ]]
+}
+
+stop_client_containers() {
+  log_step "[SAFETY LOCKDOWN] Stopping dependent client application containers..."
+  for container in $CONTAINERS; do
+    if [[ "$container" != "$NZBDAV_CONTAINER" ]] && [[ "$container" != "$DECYPHAR_CONTAINER" ]]; then
+      if is_container_running "$container"; then
+        docker stop "$container" >/dev/null 2>&1 || true
+      fi
+    fi
+  done
+}
+
+check_mount_access() {
+  local target="$1"
+  [[ -z "$target" ]] && return 1
+  if [ -d "$target" ] && timeout 5 ls "$target" >/dev/null 2>&1; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Process lock management
+if [[ "$*" == *"-f"* ]] || [[ "$*" == *"--force"* ]]; then
+  FORCE_RESET="Y"
+fi
+
+if [[ "$FORCE_RESET" == "Y" ]]; then
+  log_step "[FORCE RESET] Terminating existing Sentinel instances & clearing locks..."
+  pkill -9 -f "native_storage_heartbeat" >/dev/null 2>&1 || true
+  fuser -k -9 "$LOCKFILE" >/dev/null 2>&1 || true
+  sleep 1
+fi
+
+cleanup() {
+  flock -u 9 2>/dev/null || true
+  exec 9>&- 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM HUP
+
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+  log_step "[ABORT] Script is already running (PID $(cat "$LOCKFILE" 2>/dev/null)). Exiting."
+  exit 1
+fi
+echo $$ >&9
+
+##### --- 2.2 ENVIRONMENT PREPARATION & CONFIG SUMMARY ---
+mkdir -p "$(dirname "$STATE_FILE")" "$(dirname "$LOG_FILE")"
+
+log_step "VALIDATING: Native storage configuration and environment..."
+log_step "---------------------------------------------------"
+log_step "[CONFIG SUMMARY]"
+log_step "Script Version: $SCRIPT_VERSION"
+log_step "Execution Mode: $( [[ "$FORCE_RESET" == "Y" ]] && echo "HARD RESET (-f)" || echo "HEARTBEAT MONITOR" )"
+log_step "Primary Container: $NZBDAV_CONTAINER ($MOUNT_PATH)"
+log_step "Secondary Container: $DECYPHAR_CONTAINER ($DECYPH_PATH)"
+log_step "Auto-Update Enabled: $ENABLE_AUTO_UPDATE (Target Window: $UPDATE_TIME)"
+log_step "State File: $STATE_FILE"
+log_step "---------------------------------------------------"
+
+##### --- 2.3 HARD RESET EXECUTION (-f) ---
+if [[ "$FORCE_RESET" == "Y" ]]; then
+  log_step "======================================================================================"
+  log_step "HARD RESET INITIATED: Stopping client containers and restarting native storage engines."
+  log_step "======================================================================================"
+
+  stop_client_containers
+
+  # Restart backend native storage containers
+  log_step "[RESET 2/3] Restarting native storage backend containers..."
+  docker restart "$NZBDAV_CONTAINER" >/dev/null 2>&1 || true
+  [[ -n "$DECYPHAR_CONTAINER" ]] && docker restart "$DECYPHAR_CONTAINER" >/dev/null 2>&1 || true
+  sleep 8
+
+  # Update state file to DOWN and exit cleanly
+  log_step "[RESET 3/3] Updating state file and exiting HARD RESET..."
+  {
+    echo "NZB_STATE=\"DOWN\""
+    echo "NZB_START_TS=\"$(date +%s)\""
+    echo "DEC_STATE=\"DOWN\""
+    echo "DEC_START_TS=\"$(date +%s)\""
+  } > "$STATE_FILE"
+
+  log_step "HARD RESET COMPLETE: Storage engines reset, state set to DOWN."
+  log_step "======================================================================================"
+  exit 0
+fi
+
+##### --------------------------------------------------------------------------------------
+##### 3.0 NATIVE STORAGE & MOUNT AUDIT
+##### --------------------------------------------------------------------------------------
+
+[ -f "$STATE_FILE" ] && source "$STATE_FILE"
+
+##### --- 3.1 PRIMARY NATIVE MOUNT AUDIT (NZBDAV V2) ---
+log_step "CHECKING: Primary native mount ($NZBDAV_CONTAINER -> $MOUNT_PATH)..."
+
+NZB_MOUNT_ALIVE=false
+if is_container_running "$NZBDAV_CONTAINER" && check_mount_access "$MOUNT_PATH"; then
+  NZB_MOUNT_ALIVE=true
+  log_step "SUCCESS: Primary native mount ($MOUNT_PATH) is ONLINE."
+else
+  log_step "[!] Primary native mount failed check or container is stopped. Initiating restart & retry sequence..."
+  docker restart "$NZBDAV_CONTAINER" >/dev/null 2>&1 || true
+
+  # Retry loop: check every 12s for up to 1 minute (5 attempts)
+  N_COUNT=0
+  while [ $N_COUNT -lt 5 ]; do
+    sleep 12
+    if check_mount_access "$MOUNT_PATH"; then
+      NZB_MOUNT_ALIVE=true
+      log_step "SUCCESS: Primary native mount restored (Attempt $((N_COUNT + 1))/5)."
+      send_notification "Native Storage Restored" "Infinidysk V2 mount restored at $MOUNT_PATH" "normal"
+      break
+    fi
+    log_step "WAITING: Primary mount not ready (Attempt $((N_COUNT + 1))/5 - retrying in 12s)..."
+    ((N_COUNT++))
+  done
+fi
+
+# Update Primary State & Emergency Action if Mount Failed
+if [[ "$NZB_MOUNT_ALIVE" == "true" ]]; then
+  if [[ "$NZB_STATE" != "UP" ]]; then
+    NZB_STATE="UP"
+    NZB_START_TS=$(date +%s)
+  fi
+else
+  log_step "[CRITICAL ERROR] Primary native mount failed to initialize after 1 minute."
+  if [[ "$NZB_STATE" != "DOWN" ]]; then
+    NZB_STATE="DOWN"
+    NZB_START_TS=$(date +%s)
+  fi
+
+  # Stop client dockers to protect database & media stack integrity
+  stop_client_containers
+  send_notification "Native Storage Failed" "Primary mount ($MOUNT_PATH) failed to come online after 1 minute. Client containers stopped for safety." "alert"
+fi
+
+##### --- 3.2 SECONDARY NATIVE MOUNT AUDIT (DECYPHARR DFS) ---
+DEC_MOUNT_ALIVE=false
+if [[ -n "$DECYPH_PATH" ]] && [[ -n "$DECYPHAR_CONTAINER" ]]; then
+  log_step "CHECKING: Secondary native mount ($DECYPHAR_CONTAINER -> $DECYPH_PATH)..."
+
+  if is_container_running "$DECYPHAR_CONTAINER" && check_mount_access "$DECYPH_PATH"; then
+    DEC_MOUNT_ALIVE=true
+    log_step "SUCCESS: Secondary native mount ($DECYPH_PATH) is ONLINE."
+  else
+    log_step "[!] Secondary native mount failed check. Initiating restart & retry sequence..."
+    docker restart "$DECYPHAR_CONTAINER" >/dev/null 2>&1 || true
+
+    D_COUNT=0
+    while [ $D_COUNT -lt 5 ]; do
+      sleep 12
+      if check_mount_access "$DECYPH_PATH"; then
+        DEC_MOUNT_ALIVE=true
+        log_step "SUCCESS: Secondary native mount restored (Attempt $((D_COUNT + 1))/5)."
+        break
+      fi
+      log_step "WAITING: Secondary mount not ready (Attempt $((D_COUNT + 1))/5 - retrying in 12s)..."
+      ((D_COUNT++))
+    done
+  fi
+
+  # Update Secondary State
+  if [[ "$DEC_MOUNT_ALIVE" == "true" ]]; then
+    if [[ "$DEC_STATE" != "UP" ]]; then
+      DEC_STATE="UP"
+      DEC_START_TS=$(date +%s)
+    fi
+  else
+    log_step "[WARN] Secondary native mount failed to initialize after 1 minute."
+    if [[ "$DEC_STATE" != "DOWN" ]]; then
+      DEC_STATE="DOWN"
+      DEC_START_TS=$(date +%s)
+    fi
+  fi
+fi
+
+if [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
+  # State persistence before aborting
+  {
+    echo "NZB_STATE=\"$NZB_STATE\""
+    echo "NZB_START_TS=\"$NZB_START_TS\""
+    echo "DEC_STATE=\"$DEC_STATE\""
+    echo "DEC_START_TS=\"$DEC_START_TS\""
+  } > "$STATE_FILE"
+  log_step "[ABORT] Primary native mount is offline. Client container restoration aborted. Script will retry on next execution."
+  exit 1
+fi
+
+##### --------------------------------------------------------------------------------------
+##### 4.0 CLIENT CONTAINER RESTORATION & SUMMARY
+##### --------------------------------------------------------------------------------------
+
+##### --- 4.1 DAILY CONTAINER AUTO-UPDATE ENGINE ---
+if [[ "$ENABLE_AUTO_UPDATE" == "true" ]] && [[ "$NZB_MOUNT_ALIVE" == "true" ]]; then
+  CURRENT_DATE=$(date +%Y-%m-%d)
+  CURRENT_TIME=$(date +%H:%M)
+  LAST_UPDATE_DATE=""
+  [ -f "$UPDATE_STATE_FILE" ] && LAST_UPDATE_DATE=$(cat "$UPDATE_STATE_FILE" 2>/dev/null | tr -d '[:space:]')
+
+  if [[ "$CURRENT_DATE" != "$LAST_UPDATE_DATE" ]] && [[ "$CURRENT_TIME" > "$UPDATE_TIME" || "$CURRENT_TIME" == "$UPDATE_TIME" ]]; then
+    log_step "[AUTO-UPDATE] Triggering once-a-day container image pull & stack recreation (Target Window: $UPDATE_TIME)..."
+    mkdir -p "$(dirname "$UPDATE_STATE_FILE")"
+    echo "$CURRENT_DATE" > "$UPDATE_STATE_FILE"
+
+    # Gather unique compose project directories from CONTAINER_PROJECTS
+    declare -A UNIQUE_PROJECTS
+    for proj_path in "${CONTAINER_PROJECTS[@]}"; do
+      if [[ -n "$proj_path" ]]; then
+        UNIQUE_PROJECTS["$proj_path"]=1
+      fi
+    done
+
+    for proj in "${!UNIQUE_PROJECTS[@]}"; do
+      if [ -d "$proj" ] && { [ -f "$proj/compose.yml" ] || [ -f "$proj/docker-compose.yml" ]; }; then
+        PROJ_NAME=$(basename "$proj")
+        log_step "[AUTO-UPDATE] Pulling latest images & updating stack: ${PROJ_NAME} (${proj})..."
+        (cd "$proj" && docker compose pull >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1) || true
+      fi
+    done
+    log_step "SUCCESS: Daily container updates completed for $CURRENT_DATE."
+  fi
+fi
+
+##### --- 4.2 CLIENT CONTAINER RESTORATION ---
+log_step "RESTORATION: Ensuring all client application containers are active..."
+if [[ "$NZB_MOUNT_ALIVE" == "true" ]]; then
+  for container in $CONTAINERS; do
+    if [[ -n "$container" ]]; then
+      RUNNING_STATE=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "missing")
+      if [ "$RUNNING_STATE" != "true" ]; then
+        PROJECT_DIR="${CONTAINER_PROJECTS[$container]}"
+        if [ -n "$PROJECT_DIR" ] && { [ -f "$PROJECT_DIR/compose.yml" ] || [ -f "$PROJECT_DIR/docker-compose.yml" ]; }; then
+          log_step "Restoring compose container: $container (project: $PROJECT_DIR)..."
+          (cd "$PROJECT_DIR" && docker compose up -d --no-deps "$container" >/dev/null 2>&1)
+          sleep 1
+        elif [ "$RUNNING_STATE" != "missing" ]; then
+          log_step "Restoring standalone container: $container..."
+          docker start "$container" >/dev/null 2>&1
+          sleep 1
+        fi
+      fi
+    fi
+  done
+fi
+
+##### --- 4.3 STATE PERSISTENCE & FINAL SUMMARY ---
+{
+  echo "NZB_STATE=\"$NZB_STATE\""
+  echo "NZB_START_TS=\"$NZB_START_TS\""
+  echo "DEC_STATE=\"$DEC_STATE\""
+  echo "DEC_START_TS=\"$DEC_START_TS\""
+} > "$STATE_FILE"
+
+calculate_duration() {
+  local ts=${1:-$(date +%s)}
+  local diff=$(($(date +%s) - ts))
+  local days=$((diff / 86400))
+  local hours=$(((diff % 86400) / 3600))
+  local mins=$(((diff % 3600) / 60))
+  if [ $days -gt 0 ]; then
+    echo "${days}d ${hours}h ${mins}m"
+  elif [ $hours -gt 0 ]; then
+    echo "${hours}h ${mins}m"
+  else
+    echo "${mins}m"
+  fi
+}
+
+FREE_RAM_KB=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo "0")
+FREE_RAM_MB=$((FREE_RAM_KB / 1024))
+
+NZB_TIME=$(calculate_duration "${NZB_START_TS:-$(date +%s)}")
+if [[ -n "$DECYPHAR_CONTAINER" ]]; then
+  DEC_TIME=$(calculate_duration "${DEC_START_TS:-$(date +%s)}")
+  DEC_DISPLAY="${DEC_STATE} (${DEC_TIME})"
+else
+  DEC_DISPLAY="DISABLED"
+fi
+
+log_step ""
+log_step "Status Summary:"
+log_step "Primary (${NZBDAV_CONTAINER}) ${NZB_STATE} (${NZB_TIME}) | Secondary (${DECYPHAR_CONTAINER}) ${DEC_DISPLAY} | Free RAM: ${FREE_RAM_MB} MB"
+log_step "--------------------------------------------------------------------------------------"
+log_step "STATUS: All Native Storage Systems Operational."
+
+exit 0
